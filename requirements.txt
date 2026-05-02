@@ -1,0 +1,22 @@
+# HardwareTA — Local RAG agent for hardware datasheets
+# Install with: pip install -r requirements.txt
+
+# PDF parsing — use fitz (PyMuPDF), NOT pypdf — handles complex datasheet layouts
+PyMuPDF>=1.23.0
+
+# Embeddings — ~90 MB model download on first run (all-MiniLM-L6-v2)
+# If unreachable, the tool falls back automatically to TF-IDF (no download needed)
+sentence-transformers>=2.2.2
+
+# Offline TF-IDF fallback embedder (used when sentence-transformers is unavailable)
+scikit-learn>=1.0.0
+
+# Numerical backend
+numpy>=1.24.0
+
+# For download_sample.py (optional — only needed to fetch sample PDFs)
+requests>=2.28.0
+
+# NOTE: Ollama is NOT a pip package.
+# Install it from https://ollama.com and run: ollama pull llama3
+# Without Ollama, the tool still works — it shows the raw retrieved passages + page citations.
