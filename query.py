@@ -3,18 +3,122 @@ query.py — Retrieve relevant passages and generate an answer via Ollama
 """
 
 import sys
+import json
 import pickle
-import subprocess
 import textwrap
+import urllib.request
+import urllib.error
 from pathlib import Path
 
-STORE_DIR    = Path(__file__).parent.parent / ".rag_store"
-EMBED_MODEL  = "all-MiniLM-L6-v2"
-TOP_K        = 5
-OLLAMA_MODEL = "llama3"   # change to: mistral, phi3, gemma2, etc.
+# ── Config ────────────────────────────────────────────────────────────────────
+STORE_DIR      = Path(__file__).parent.parent / ".rag_store"
+EMBED_MODEL    = "all-MiniLM-L6-v2"
+TOP_K          = 5
+OLLAMA_MODEL   = None             # None = auto-detect first available model
+OLLAMA_URL     = "http://localhost:11434"
+OLLAMA_TIMEOUT = 180              # seconds — bump this on slow machines
 
 
-# ── Embedder (must match what was used at ingest time) ────────────────────────
+# ── Ollama helpers ────────────────────────────────────────────────────────────
+def _ollama_get(path: str):
+    """GET from Ollama REST API, return parsed JSON or None."""
+    try:
+        req = urllib.request.Request(f"{OLLAMA_URL}{path}")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def _ollama_post(path: str, payload: dict, timeout: int = OLLAMA_TIMEOUT):
+    """POST to Ollama REST API, return parsed JSON or raise."""
+    data = json.dumps(payload).encode()
+    req  = urllib.request.Request(
+        f"{OLLAMA_URL}{path}",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def detect_model() -> str | None:
+    """
+    Return the model name to use:
+      1. OLLAMA_MODEL constant if set
+      2. First model returned by /api/tags
+      3. None if Ollama is unreachable
+    """
+    if OLLAMA_MODEL:
+        return OLLAMA_MODEL
+    data = _ollama_get("/api/tags")
+    if data and data.get("models"):
+        name = data["models"][0]["name"]
+        return name
+    return None
+
+
+def ollama_reachable() -> bool:
+    return _ollama_get("/api/tags") is not None
+
+
+# ── Generation ────────────────────────────────────────────────────────────────
+def ask_ollama(prompt: str) -> str:
+    """
+    Call Ollama via its HTTP REST API (/api/generate).
+    Auto-detects the first available model if OLLAMA_MODEL is None.
+    Falls back to displaying raw retrieved passages if Ollama is unreachable.
+    """
+    model = detect_model()
+
+    if model is None:
+        return _no_ollama_response(prompt)
+
+    print(f"    Using model: {model}")
+
+    try:
+        result = _ollama_post(
+            "/api/generate",
+            {
+                "model":  model,
+                "prompt": prompt,
+                "stream": False,        # wait for the full response
+                "options": {
+                    "temperature": 0.1, # low temp = more factual
+                    "num_predict": 512,
+                },
+            },
+            timeout=OLLAMA_TIMEOUT,
+        )
+        return result.get("response", "").strip()
+
+    except urllib.error.URLError as e:
+        return f"[Ollama connection error] {e.reason}\nIs 'ollama serve' running?"
+    except TimeoutError:
+        return (
+            f"[Ollama timed out after {OLLAMA_TIMEOUT}s]\n"
+            "Try a smaller model: ollama pull phi3\n"
+            f"Or increase OLLAMA_TIMEOUT in src/query.py (currently {OLLAMA_TIMEOUT}s)"
+        )
+    except Exception as e:
+        return f"[Ollama error] {type(e).__name__}: {e}"
+
+
+def _no_ollama_response(prompt: str) -> str:
+    excerpts = prompt.split("DATASHEET EXCERPTS:\n", 1)[-1].split("\n\nANSWER")[0]
+    return (
+        "⚠️  Ollama not reachable at " + OLLAMA_URL + "\n"
+        "   • Make sure Ollama is running: ollama serve\n"
+        "   • Pull a model if needed:      ollama pull phi3\n"
+        "   • Then re-run your question.\n"
+        + "─" * 60 + "\n"
+        + "[Raw retrieved passages shown below]\n\n"
+        + excerpts
+    )
+
+
+# ── Embedder (must match ingest time) ─────────────────────────────────────────
 def load_embedder():
     try:
         from sentence_transformers import SentenceTransformer
@@ -71,41 +175,15 @@ def build_prompt(question: str, passages: list) -> str:
         "Answer the question using ONLY the datasheet excerpts below.\n"
         "Cite every claim with [filename, p.N]. If the excerpts lack the info, say so.\n\n"
         f"QUESTION:\n{question}\n\n"
-        f"DATASHEET EXCERPTS:\n" + "\n\n---\n\n".join(parts) +
+        "DATASHEET EXCERPTS:\n" + "\n\n---\n\n".join(parts) +
         "\n\nANSWER (with page citations):"
-    )
-
-
-# ── Generation ────────────────────────────────────────────────────────────────
-def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
-    try:
-        result = subprocess.run(
-            ["ollama", "run", model],
-            input=prompt, capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-        return f"[Ollama error] {result.stderr.strip() or 'no output'}"
-    except FileNotFoundError:
-        return _no_ollama_response(prompt)
-    except subprocess.TimeoutExpired:
-        return "[Ollama timed out — try: ollama pull phi3]"
-
-
-def _no_ollama_response(prompt: str) -> str:
-    excerpts = prompt.split("DATASHEET EXCERPTS:\n", 1)[-1].split("\n\nANSWER")[0]
-    return (
-        "[Ollama not installed — showing raw retrieved passages]\n"
-        "Install from https://ollama.com  then: ollama pull llama3\n"
-        + "─" * 60 + "\n"
-        + excerpts
     )
 
 
 # ── Display ───────────────────────────────────────────────────────────────────
 def format_sources(passages: list) -> str:
     W = 58
-    lines = [f"┌─ Top {len(passages)} retrieved passages {'─'*W}"]
+    lines = [f"┌─ Top {len(passages)} retrieved passages {'─' * W}"]
     for i, p in enumerate(passages):
         snippet = textwrap.shorten(p["text"], width=W + 2, placeholder="…")
         lines.append(f"│ [{i+1}] {p['source']}  p.{p['page_num']}  score={p['score']:.3f}")
@@ -117,13 +195,22 @@ def format_sources(passages: list) -> str:
 # ── Public API ────────────────────────────────────────────────────────────────
 def answer(question: str, verbose: bool = True) -> dict:
     if verbose:
+        # Show Ollama status upfront so there are no surprises
+        model = detect_model()
+        if model:
+            print(f"\n[Ollama ✓] Connected — model: {model}")
+        else:
+            print(f"\n[Ollama ✗] Not reachable at {OLLAMA_URL}")
+            print("           Run 'ollama serve' in another terminal, then retry.\n")
+
         print(f"\n🔍  {question}\n")
         print("    Retrieving relevant passages …")
 
     passages    = retrieve(question)
+
     if verbose:
         print(format_sources(passages))
-        print("\n    Generating answer via Ollama …\n")
+        print("\n    Generating answer …\n")
 
     prompt      = build_prompt(question, passages)
     answer_text = ask_ollama(prompt)
